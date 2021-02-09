@@ -2,6 +2,7 @@ package schema
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,13 +80,54 @@ func (r *ConfigFieldReader) readField(
 
 	k := strings.Join(address, ".")
 	schema := schemaList[len(schemaList)-1]
+
+	// If we're getting the single element of a promoted list, then
+	// check to see if we have a single element we need to promote.
+	if address[len(address)-1] == "0" && len(schemaList) > 1 {
+		lastSchema := schemaList[len(schemaList)-2]
+		if lastSchema.Type == TypeList && lastSchema.PromoteSingle {
+			k := strings.Join(address[:len(address)-1], ".")
+			result, err := r.readPrimitive(k, schema)
+			if err == nil {
+				return result, nil
+			}
+		}
+	}
+
+	if protoVersion5 {
+		switch schema.Type {
+		case TypeList, TypeSet, TypeMap, typeObject:
+			// Check if the value itself is unknown.
+			// The new protocol shims will add unknown values to this list of
+			// ComputedKeys. This is the only way we have to indicate that a
+			// collection is unknown in the config
+			for _, unknown := range r.Config.ComputedKeys {
+				if k == unknown {
+					log.Printf("[DEBUG] setting computed for %q from ComputedKeys", k)
+					return FieldReadResult{Computed: true, Exists: true}, nil
+				}
+			}
+		}
+	}
+
 	switch schema.Type {
 	case TypeBool, TypeFloat, TypeInt, TypeString:
 		return r.readPrimitive(k, schema)
 	case TypeList:
+		// If we support promotion then we first check if we have a lone
+		// value that we must promote.
+		// a value that is alone.
+		if schema.PromoteSingle {
+			result, err := r.readPrimitive(k, schema.Elem.(*Schema))
+			if err == nil && result.Exists {
+				result.Value = []interface{}{result.Value}
+				return result, nil
+			}
+		}
+
 		return readListField(&nestedConfigFieldReader{r}, address, schema)
 	case TypeMap:
-		return r.readMap(k)
+		return r.readMap(k, schema)
 	case TypeSet:
 		return r.readSet(address, schema)
 	case typeObject:
@@ -97,14 +139,25 @@ func (r *ConfigFieldReader) readField(
 	}
 }
 
-func (r *ConfigFieldReader) readMap(k string) (FieldReadResult, error) {
+func (r *ConfigFieldReader) readMap(k string, schema *Schema) (FieldReadResult, error) {
 	// We want both the raw value and the interpolated. We use the interpolated
 	// to store actual values and we use the raw one to check for
 	// computed keys. Actual values are obtained in the switch, depending on
 	// the type of the raw value.
 	mraw, ok := r.Config.GetRaw(k)
 	if !ok {
-		return FieldReadResult{}, nil
+		// check if this is from an interpolated field by seeing if it exists
+		// in the config
+		_, ok := r.Config.Get(k)
+		if !ok {
+			// this really doesn't exist
+			return FieldReadResult{}, nil
+		}
+
+		// We couldn't fetch the value from a nested data structure, so treat the
+		// raw value as an interpolation string. The mraw value is only used
+		// for the type switch below.
+		mraw = "${INTERPOLATED}"
 	}
 
 	result := make(map[string]interface{})
@@ -166,8 +219,16 @@ func (r *ConfigFieldReader) readMap(k string) (FieldReadResult, error) {
 			v, _ := r.Config.Get(key)
 			result[ik] = v
 		}
+	case nil:
+		// the map may have been empty on the configuration, so we leave the
+		// empty result
 	default:
 		panic(fmt.Sprintf("unknown type: %#v", mraw))
+	}
+
+	err := mapValuesToPrimitive(k, result, schema)
+	if err != nil {
+		return FieldReadResult{}, nil
 	}
 
 	var value interface{}

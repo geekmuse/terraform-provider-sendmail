@@ -4,16 +4,20 @@ import (
 	"net/rpc"
 
 	"github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/terraform"
 )
 
 // ResourceProvisionerPlugin is the plugin.Plugin implementation.
 type ResourceProvisionerPlugin struct {
-	F func() terraform.ResourceProvisioner
+	ResourceProvisioner func() terraform.ResourceProvisioner
 }
 
 func (p *ResourceProvisionerPlugin) Server(b *plugin.MuxBroker) (interface{}, error) {
-	return &ResourceProvisionerServer{Broker: b, Provisioner: p.F()}, nil
+	return &ResourceProvisionerServer{
+		Broker:      b,
+		Provisioner: p.ResourceProvisioner(),
+	}, nil
 }
 
 func (p *ResourceProvisionerPlugin) Client(
@@ -26,6 +30,10 @@ func (p *ResourceProvisionerPlugin) Client(
 type ResourceProvisioner struct {
 	Broker *plugin.MuxBroker
 	Client *rpc.Client
+}
+
+func (p *ResourceProvisioner) GetConfigSchema() (*configschema.Block, error) {
+	panic("not implemented")
 }
 
 func (p *ResourceProvisioner) Validate(c *terraform.ResourceConfig) ([]string, []error) {
@@ -77,6 +85,19 @@ func (p *ResourceProvisioner) Apply(
 	return err
 }
 
+func (p *ResourceProvisioner) Stop() error {
+	var resp ResourceProvisionerStopResponse
+	err := p.Client.Call("Plugin.Stop", new(interface{}), &resp)
+	if err != nil {
+		return err
+	}
+	if resp.Error != nil {
+		err = resp.Error
+	}
+
+	return err
+}
+
 func (p *ResourceProvisioner) Close() error {
 	return p.Client.Close()
 }
@@ -97,6 +118,10 @@ type ResourceProvisionerApplyArgs struct {
 }
 
 type ResourceProvisionerApplyResponse struct {
+	Error *plugin.BasicError
+}
+
+type ResourceProvisionerStopResponse struct {
 	Error *plugin.BasicError
 }
 
@@ -141,5 +166,16 @@ func (s *ResourceProvisionerServer) Validate(
 		Warnings: warns,
 		Errors:   berrs,
 	}
+	return nil
+}
+
+func (s *ResourceProvisionerServer) Stop(
+	_ interface{},
+	reply *ResourceProvisionerStopResponse) error {
+	err := s.Provisioner.Stop()
+	*reply = ResourceProvisionerStopResponse{
+		Error: plugin.NewBasicError(err),
+	}
+
 	return nil
 }

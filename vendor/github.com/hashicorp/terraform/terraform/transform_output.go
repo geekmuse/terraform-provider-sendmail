@@ -1,98 +1,103 @@
 package terraform
 
 import (
-	"fmt"
+	"log"
 
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/dag"
+	"github.com/hashicorp/terraform/plans"
 )
 
-// GraphNodeOutput is an interface that nodes that are outputs must
-// implement. The OutputName returned is the name of the output key
-// that they manage.
-type GraphNodeOutput interface {
-	OutputName() string
+// OutputTransformer is a GraphTransformer that adds all the outputs
+// in the configuration to the graph.
+//
+// This is done for the apply graph builder even if dependent nodes
+// aren't changing since there is no downside: the state will be available
+// even if the dependent items aren't changing.
+type OutputTransformer struct {
+	Config  *configs.Config
+	Changes *plans.Changes
+
+	// if this is a planed destroy, root outputs are still in the configuration
+	// so we need to record that we wish to remove them
+	Destroy bool
 }
 
-// AddOutputOrphanTransformer is a transformer that adds output orphans
-// to the graph. Output orphans are outputs that are no longer in the
-// configuration and therefore need to be removed from the state.
-type AddOutputOrphanTransformer struct {
-	State *State
+func (t *OutputTransformer) Transform(g *Graph) error {
+	return t.transform(g, t.Config)
 }
 
-func (t *AddOutputOrphanTransformer) Transform(g *Graph) error {
-	// Get the state for this module. If we have no state, we have no orphans
-	state := t.State.ModuleByPath(g.Path)
-	if state == nil {
+func (t *OutputTransformer) transform(g *Graph, c *configs.Config) error {
+	// If we have no config then there can be no outputs.
+	if c == nil {
 		return nil
 	}
 
-	// Create the set of outputs we do have in the graph
-	found := make(map[string]struct{})
-	for _, v := range g.Vertices() {
-		on, ok := v.(GraphNodeOutput)
-		if !ok {
-			continue
+	// Transform all the children. We must do this first because
+	// we can reference module outputs and they must show up in the
+	// reference map.
+	for _, cc := range c.Children {
+		if err := t.transform(g, cc); err != nil {
+			return err
 		}
-
-		found[on.OutputName()] = struct{}{}
 	}
 
-	// Go over all the outputs. If we don't have a graph node for it,
-	// create it. It doesn't need to depend on anything, since its just
-	// setting it empty.
-	for k, _ := range state.Outputs {
-		if _, ok := found[k]; ok {
-			continue
+	// Add outputs to the graph, which will be dynamically expanded
+	// into NodeApplyableOutputs to reflect possible expansion
+	// through the presence of "count" or "for_each" on the modules.
+
+	var changes []*plans.OutputChangeSrc
+	if t.Changes != nil {
+		changes = t.Changes.Outputs
+	}
+
+	for _, o := range c.Module.Outputs {
+		addr := addrs.OutputValue{Name: o.Name}
+
+		var rootChange *plans.OutputChangeSrc
+		for _, c := range changes {
+			if c.Addr.Module.IsRoot() && c.Addr.OutputValue.Name == o.Name {
+				rootChange = c
+			}
 		}
 
-		g.Add(&graphNodeOrphanOutput{OutputName: k})
+		destroy := t.Destroy
+		if rootChange != nil {
+			destroy = rootChange.Action == plans.Delete
+		}
+
+		// If this is a root output, we add the apply or destroy node directly,
+		// as the root modules does not expand.
+
+		var node dag.Vertex
+		switch {
+		case c.Path.IsRoot() && destroy:
+			node = &NodeDestroyableOutput{
+				Addr:   addr.Absolute(addrs.RootModuleInstance),
+				Config: o,
+			}
+
+		case c.Path.IsRoot():
+			node = &NodeApplyableOutput{
+				Addr:   addr.Absolute(addrs.RootModuleInstance),
+				Config: o,
+				Change: rootChange,
+			}
+
+		default:
+			node = &nodeExpandOutput{
+				Addr:    addr,
+				Module:  c.Path,
+				Config:  o,
+				Changes: changes,
+				Destroy: t.Destroy,
+			}
+		}
+
+		log.Printf("[TRACE] OutputTransformer: adding %s as %T", o.Name, node)
+		g.Add(node)
 	}
 
 	return nil
-}
-
-type graphNodeOrphanOutput struct {
-	OutputName string
-}
-
-func (n *graphNodeOrphanOutput) Name() string {
-	return fmt.Sprintf("output.%s (orphan)", n.OutputName)
-}
-
-func (n *graphNodeOrphanOutput) EvalTree() EvalNode {
-	return &EvalOpFilter{
-		Ops: []walkOperation{walkApply, walkDestroy, walkRefresh},
-		Node: &EvalDeleteOutput{
-			Name: n.OutputName,
-		},
-	}
-}
-
-// GraphNodeFlattenable impl.
-func (n *graphNodeOrphanOutput) Flatten(p []string) (dag.Vertex, error) {
-	return &graphNodeOrphanOutputFlat{
-		graphNodeOrphanOutput: n,
-		PathValue:             p,
-	}, nil
-}
-
-type graphNodeOrphanOutputFlat struct {
-	*graphNodeOrphanOutput
-
-	PathValue []string
-}
-
-func (n *graphNodeOrphanOutputFlat) Name() string {
-	return fmt.Sprintf(
-		"%s.%s", modulePrefixStr(n.PathValue), n.graphNodeOrphanOutput.Name())
-}
-
-func (n *graphNodeOrphanOutputFlat) EvalTree() EvalNode {
-	return &EvalOpFilter{
-		Ops: []walkOperation{walkApply, walkDestroy, walkRefresh},
-		Node: &EvalDeleteOutput{
-			Name: n.OutputName,
-		},
-	}
 }

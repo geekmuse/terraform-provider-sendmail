@@ -4,16 +4,26 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
-	"sync"
 )
 
 // Graph is used to represent a dependency graph.
 type Graph struct {
-	vertices  *Set
-	edges     *Set
-	downEdges map[interface{}]*Set
-	upEdges   map[interface{}]*Set
-	once      sync.Once
+	vertices  Set
+	edges     Set
+	downEdges map[interface{}]Set
+	upEdges   map[interface{}]Set
+}
+
+// Subgrapher allows a Vertex to be a Graph itself, by returning a Grapher.
+type Subgrapher interface {
+	Subgraph() Grapher
+}
+
+// A Grapher is any type that returns a Grapher, mainly used to identify
+// dag.Graph and dag.AcyclicGraph.  In the case of Graph and AcyclicGraph, they
+// return themselves.
+type Grapher interface {
+	DirectedGraph() Grapher
 }
 
 // Vertex of the graph.
@@ -26,12 +36,15 @@ type NamedVertex interface {
 	Name() string
 }
 
+func (g *Graph) DirectedGraph() Grapher {
+	return g
+}
+
 // Vertices returns the list of all the vertices in the graph.
 func (g *Graph) Vertices() []Vertex {
-	list := g.vertices.List()
-	result := make([]Vertex, len(list))
-	for i, v := range list {
-		result[i] = v.(Vertex)
+	result := make([]Vertex, 0, len(g.vertices))
+	for _, v := range g.vertices {
+		result = append(result, v.(Vertex))
 	}
 
 	return result
@@ -39,10 +52,35 @@ func (g *Graph) Vertices() []Vertex {
 
 // Edges returns the list of all the edges in the graph.
 func (g *Graph) Edges() []Edge {
-	list := g.edges.List()
-	result := make([]Edge, len(list))
-	for i, v := range list {
-		result[i] = v.(Edge)
+	result := make([]Edge, 0, len(g.edges))
+	for _, v := range g.edges {
+		result = append(result, v.(Edge))
+	}
+
+	return result
+}
+
+// EdgesFrom returns the list of edges from the given source.
+func (g *Graph) EdgesFrom(v Vertex) []Edge {
+	var result []Edge
+	from := hashcode(v)
+	for _, e := range g.Edges() {
+		if hashcode(e.Source()) == from {
+			result = append(result, e)
+		}
+	}
+
+	return result
+}
+
+// EdgesTo returns the list of edges to the given target.
+func (g *Graph) EdgesTo(v Vertex) []Edge {
+	var result []Edge
+	search := hashcode(v)
+	for _, e := range g.Edges() {
+		if hashcode(e.Target()) == search {
+			result = append(result, e)
+		}
 	}
 
 	return result
@@ -61,7 +99,7 @@ func (g *Graph) HasEdge(e Edge) bool {
 // Add adds a vertex to the graph. This is safe to call multiple time with
 // the same Vertex.
 func (g *Graph) Add(v Vertex) Vertex {
-	g.once.Do(g.init)
+	g.init()
 	g.vertices.Add(v)
 	return v
 }
@@ -73,10 +111,10 @@ func (g *Graph) Remove(v Vertex) Vertex {
 	g.vertices.Delete(v)
 
 	// Delete the edges to non-existent things
-	for _, target := range g.DownEdges(v).List() {
+	for _, target := range g.downEdgesNoCopy(v) {
 		g.RemoveEdge(BasicEdge(v, target))
 	}
-	for _, source := range g.UpEdges(v).List() {
+	for _, source := range g.upEdgesNoCopy(v) {
 		g.RemoveEdge(BasicEdge(source, v))
 	}
 
@@ -99,10 +137,10 @@ func (g *Graph) Replace(original, replacement Vertex) bool {
 
 	// Add our new vertex, then copy all the edges
 	g.Add(replacement)
-	for _, target := range g.DownEdges(original).List() {
+	for _, target := range g.downEdgesNoCopy(original) {
 		g.Connect(BasicEdge(replacement, target))
 	}
-	for _, source := range g.UpEdges(original).List() {
+	for _, source := range g.upEdgesNoCopy(original) {
 		g.Connect(BasicEdge(source, replacement))
 	}
 
@@ -114,7 +152,7 @@ func (g *Graph) Replace(original, replacement Vertex) bool {
 
 // RemoveEdge removes an edge from the graph.
 func (g *Graph) RemoveEdge(edge Edge) {
-	g.once.Do(g.init)
+	g.init()
 
 	// Delete the edge from the set
 	g.edges.Delete(edge)
@@ -128,15 +166,30 @@ func (g *Graph) RemoveEdge(edge Edge) {
 	}
 }
 
-// DownEdges returns the outward edges from the source Vertex v.
-func (g *Graph) DownEdges(v Vertex) *Set {
-	g.once.Do(g.init)
+// UpEdges returns the vertices connected to the outward edges from the source
+// Vertex v.
+func (g *Graph) UpEdges(v Vertex) Set {
+	return g.upEdgesNoCopy(v).Copy()
+}
+
+// DownEdges returns the vertices connected from the inward edges to Vertex v.
+func (g *Graph) DownEdges(v Vertex) Set {
+	return g.downEdgesNoCopy(v).Copy()
+}
+
+// downEdgesNoCopy returns the outward edges from the source Vertex v as a Set.
+// This Set is the same as used internally bu the Graph to prevent a copy, and
+// must not be modified by the caller.
+func (g *Graph) downEdgesNoCopy(v Vertex) Set {
+	g.init()
 	return g.downEdges[hashcode(v)]
 }
 
-// UpEdges returns the inward edges to the destination Vertex v.
-func (g *Graph) UpEdges(v Vertex) *Set {
-	g.once.Do(g.init)
+// upEdgesNoCopy returns the inward edges to the destination Vertex v as a Set.
+// This Set is the same as used internally bu the Graph to prevent a copy, and
+// must not be modified by the caller.
+func (g *Graph) upEdgesNoCopy(v Vertex) Set {
+	g.init()
 	return g.upEdges[hashcode(v)]
 }
 
@@ -145,7 +198,7 @@ func (g *Graph) UpEdges(v Vertex) *Set {
 // verified through pointer equality of the vertices, not through the
 // value of the edge itself.
 func (g *Graph) Connect(edge Edge) {
-	g.once.Do(g.init)
+	g.init()
 
 	source := edge.Source()
 	target := edge.Target()
@@ -163,7 +216,7 @@ func (g *Graph) Connect(edge Edge) {
 	// Add the down edge
 	s, ok := g.downEdges[sourceCode]
 	if !ok {
-		s = new(Set)
+		s = make(Set)
 		g.downEdges[sourceCode] = s
 	}
 	s.Add(target)
@@ -171,7 +224,7 @@ func (g *Graph) Connect(edge Edge) {
 	// Add the up edge
 	s, ok = g.upEdges[targetCode]
 	if !ok {
-		s = new(Set)
+		s = make(Set)
 		g.upEdges[targetCode] = s
 	}
 	s.Add(source)
@@ -202,16 +255,17 @@ func (g *Graph) StringWithNodeTypes() string {
 
 		// Alphabetize dependencies
 		deps := make([]string, 0, targets.Len())
-		targetNodes := make([]Vertex, 0, targets.Len())
-		for _, target := range targets.List() {
-			deps = append(deps, VertexName(target))
-			targetNodes = append(targetNodes, target)
+		targetNodes := make(map[string]Vertex)
+		for _, target := range targets {
+			dep := VertexName(target)
+			deps = append(deps, dep)
+			targetNodes[dep] = target
 		}
 		sort.Strings(deps)
 
 		// Write dependencies
-		for i, d := range deps {
-			buf.WriteString(fmt.Sprintf("  %s - %T\n", d, targetNodes[i]))
+		for _, d := range deps {
+			buf.WriteString(fmt.Sprintf("  %s - %T\n", d, targetNodes[d]))
 		}
 	}
 
@@ -243,7 +297,7 @@ func (g *Graph) String() string {
 
 		// Alphabetize dependencies
 		deps := make([]string, 0, targets.Len())
-		for _, target := range targets.List() {
+		for _, target := range targets {
 			deps = append(deps, VertexName(target))
 		}
 		sort.Strings(deps)
@@ -258,10 +312,23 @@ func (g *Graph) String() string {
 }
 
 func (g *Graph) init() {
-	g.vertices = new(Set)
-	g.edges = new(Set)
-	g.downEdges = make(map[interface{}]*Set)
-	g.upEdges = make(map[interface{}]*Set)
+	if g.vertices == nil {
+		g.vertices = make(Set)
+	}
+	if g.edges == nil {
+		g.edges = make(Set)
+	}
+	if g.downEdges == nil {
+		g.downEdges = make(map[interface{}]Set)
+	}
+	if g.upEdges == nil {
+		g.upEdges = make(map[interface{}]Set)
+	}
+}
+
+// Dot returns a dot-formatted representation of the Graph.
+func (g *Graph) Dot(opts *DotOpts) []byte {
+	return newMarshalGraph("", g).Dot(opts)
 }
 
 // VertexName returns the name of a vertex.

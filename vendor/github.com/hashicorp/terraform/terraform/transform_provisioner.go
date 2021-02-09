@@ -2,6 +2,7 @@ package terraform
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/terraform/dag"
@@ -22,8 +23,8 @@ type GraphNodeCloseProvisioner interface {
 }
 
 // GraphNodeProvisionerConsumer is an interface that nodes that require
-// a provisioner must implement. ProvisionedBy must return the name of the
-// provisioner to use.
+// a provisioner must implement. ProvisionedBy must return the names of the
+// provisioners to use.
 type GraphNodeProvisionerConsumer interface {
 	ProvisionedBy() []string
 }
@@ -47,6 +48,7 @@ func (t *ProvisionerTransformer) Transform(g *Graph) error {
 					continue
 				}
 
+				log.Printf("[TRACE] ProvisionerTransformer: %s is provisioned by %s (%q)", dag.VertexName(v), p, dag.VertexName(m[p]))
 				g.Connect(dag.BasicEdge(v, m[p]))
 			}
 		}
@@ -87,13 +89,19 @@ func (t *MissingProvisionerTransformer) Transform(g *Graph) error {
 			}
 
 			if _, ok := supported[p]; !ok {
-				// If we don't support the provisioner type, skip it.
+				// If we don't support the provisioner type, we skip it.
 				// Validation later will catch this as an error.
 				continue
 			}
 
+			// Build the vertex
+			var newV dag.Vertex = &NodeProvisioner{
+				NameValue: p,
+			}
+
 			// Add the missing provisioner node to the graph
-			m[p] = g.Add(&graphNodeProvisioner{ProvisionerNameValue: p})
+			m[p] = g.Add(newV)
+			log.Printf("[TRACE] MissingProviderTransformer: added implicit provisioner %s, first implied by %s", p, dag.VertexName(v))
 		}
 	}
 
@@ -161,58 +169,11 @@ func (n *graphNodeCloseProvisioner) Name() string {
 	return fmt.Sprintf("provisioner.%s (close)", n.ProvisionerNameValue)
 }
 
-// GraphNodeEvalable impl.
-func (n *graphNodeCloseProvisioner) EvalTree() EvalNode {
-	return &EvalCloseProvisioner{Name: n.ProvisionerNameValue}
+// GraphNodeExecutable impl.
+func (n *graphNodeCloseProvisioner) Execute(ctx EvalContext, op walkOperation) error {
+	return ctx.CloseProvisioner(n.ProvisionerNameValue)
 }
 
 func (n *graphNodeCloseProvisioner) CloseProvisionerName() string {
 	return n.ProvisionerNameValue
-}
-
-type graphNodeProvisioner struct {
-	ProvisionerNameValue string
-}
-
-func (n *graphNodeProvisioner) Name() string {
-	return fmt.Sprintf("provisioner.%s", n.ProvisionerNameValue)
-}
-
-// GraphNodeEvalable impl.
-func (n *graphNodeProvisioner) EvalTree() EvalNode {
-	return &EvalInitProvisioner{Name: n.ProvisionerNameValue}
-}
-
-func (n *graphNodeProvisioner) ProvisionerName() string {
-	return n.ProvisionerNameValue
-}
-
-// GraphNodeFlattenable impl.
-func (n *graphNodeProvisioner) Flatten(p []string) (dag.Vertex, error) {
-	return &graphNodeProvisionerFlat{
-		graphNodeProvisioner: n,
-		PathValue:            p,
-	}, nil
-}
-
-// Same as graphNodeMissingProvisioner, but for flattening
-type graphNodeProvisionerFlat struct {
-	*graphNodeProvisioner
-
-	PathValue []string
-}
-
-func (n *graphNodeProvisionerFlat) Name() string {
-	return fmt.Sprintf(
-		"%s.%s", modulePrefixStr(n.PathValue), n.graphNodeProvisioner.Name())
-}
-
-func (n *graphNodeProvisionerFlat) Path() []string {
-	return n.PathValue
-}
-
-func (n *graphNodeProvisionerFlat) ProvisionerName() string {
-	return fmt.Sprintf(
-		"%s.%s", modulePrefixStr(n.PathValue),
-		n.graphNodeProvisioner.ProvisionerName())
 }

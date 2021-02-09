@@ -1,12 +1,21 @@
 package schema
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/terraform/configs/configschema"
 	"github.com/hashicorp/terraform/terraform"
 )
+
+var ReservedProviderFields = []string{
+	"alias",
+	"version",
+}
 
 // Provider represents a resource provider in Terraform, and properly
 // implements all of the ResourceProvider API.
@@ -41,13 +50,34 @@ type Provider struct {
 	// and must *not* implement Create, Update or Delete.
 	DataSourcesMap map[string]*Resource
 
+	// ProviderMetaSchema is the schema for the configuration of the meta
+	// information for this provider. If this provider has no meta info,
+	// this can be omitted. This functionality is currently experimental
+	// and subject to change or break without warning; it should only be
+	// used by providers that are collaborating on its use with the
+	// Terraform team.
+	ProviderMetaSchema map[string]*Schema
+
 	// ConfigureFunc is a function for configuring the provider. If the
 	// provider doesn't need to be configured, this can be omitted.
 	//
 	// See the ConfigureFunc documentation for more information.
 	ConfigureFunc ConfigureFunc
 
+	// MetaReset is called by TestReset to reset any state stored in the meta
+	// interface.  This is especially important if the StopContext is stored by
+	// the provider.
+	MetaReset func() error
+
 	meta interface{}
+
+	// a mutex is required because TestReset can directly replace the stopCtx
+	stopMu        sync.Mutex
+	stopCtx       context.Context
+	stopCtxCancel context.CancelFunc
+	stopOnce      sync.Once
+
+	TerraformVersion string
 }
 
 // ConfigureFunc is the function used to configure a Provider.
@@ -69,24 +99,41 @@ func (p *Provider) InternalValidate() error {
 		return errors.New("provider is nil")
 	}
 
+	var validationErrors error
 	sm := schemaMap(p.Schema)
 	if err := sm.InternalValidate(sm); err != nil {
-		return err
+		validationErrors = multierror.Append(validationErrors, err)
+	}
+
+	// Provider-specific checks
+	for k, _ := range sm {
+		if isReservedProviderFieldName(k) {
+			return fmt.Errorf("%s is a reserved field name for a provider", k)
+		}
 	}
 
 	for k, r := range p.ResourcesMap {
 		if err := r.InternalValidate(nil, true); err != nil {
-			return fmt.Errorf("resource %s: %s", k, err)
+			validationErrors = multierror.Append(validationErrors, fmt.Errorf("resource %s: %s", k, err))
 		}
 	}
 
 	for k, r := range p.DataSourcesMap {
 		if err := r.InternalValidate(nil, false); err != nil {
-			return fmt.Errorf("data source %s: %s", k, err)
+			validationErrors = multierror.Append(validationErrors, fmt.Errorf("data source %s: %s", k, err))
 		}
 	}
 
-	return nil
+	return validationErrors
+}
+
+func isReservedProviderFieldName(name string) bool {
+	for _, reservedName := range ReservedProviderFields {
+		if name == reservedName {
+			return true
+		}
+	}
+	return false
 }
 
 // Meta returns the metadata associated with this provider that was
@@ -100,6 +147,80 @@ func (p *Provider) Meta() interface{} {
 // set here.
 func (p *Provider) SetMeta(v interface{}) {
 	p.meta = v
+}
+
+// Stopped reports whether the provider has been stopped or not.
+func (p *Provider) Stopped() bool {
+	ctx := p.StopContext()
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// StopCh returns a channel that is closed once the provider is stopped.
+func (p *Provider) StopContext() context.Context {
+	p.stopOnce.Do(p.stopInit)
+
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+
+	return p.stopCtx
+}
+
+func (p *Provider) stopInit() {
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+
+	p.stopCtx, p.stopCtxCancel = context.WithCancel(context.Background())
+}
+
+// Stop implementation of terraform.ResourceProvider interface.
+func (p *Provider) Stop() error {
+	p.stopOnce.Do(p.stopInit)
+
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+
+	p.stopCtxCancel()
+	return nil
+}
+
+// TestReset resets any state stored in the Provider, and will call TestReset
+// on Meta if it implements the TestProvider interface.
+// This may be used to reset the schema.Provider at the start of a test, and is
+// automatically called by resource.Test.
+func (p *Provider) TestReset() error {
+	p.stopInit()
+	if p.MetaReset != nil {
+		return p.MetaReset()
+	}
+	return nil
+}
+
+// GetSchema implementation of terraform.ResourceProvider interface
+func (p *Provider) GetSchema(req *terraform.ProviderSchemaRequest) (*terraform.ProviderSchema, error) {
+	resourceTypes := map[string]*configschema.Block{}
+	dataSources := map[string]*configschema.Block{}
+
+	for _, name := range req.ResourceTypes {
+		if r, exists := p.ResourcesMap[name]; exists {
+			resourceTypes[name] = r.CoreConfigSchema()
+		}
+	}
+	for _, name := range req.DataSources {
+		if r, exists := p.DataSourcesMap[name]; exists {
+			dataSources[name] = r.CoreConfigSchema()
+		}
+	}
+
+	return &terraform.ProviderSchema{
+		Provider:      schemaMap(p.Schema).CoreConfigSchema(),
+		ResourceTypes: resourceTypes,
+		DataSources:   dataSources,
+	}, nil
 }
 
 // Input implementation of terraform.ResourceProvider interface.
@@ -144,7 +265,7 @@ func (p *Provider) Configure(c *terraform.ResourceConfig) error {
 
 	// Get a ResourceData for this configuration. To do this, we actually
 	// generate an intermediary "diff" although that is never exposed.
-	diff, err := sm.Diff(nil, c)
+	diff, err := sm.Diff(nil, c, nil, p.meta, true)
 	if err != nil {
 		return err
 	}
@@ -186,7 +307,21 @@ func (p *Provider) Diff(
 		return nil, fmt.Errorf("unknown resource type: %s", info.Type)
 	}
 
-	return r.Diff(s, c)
+	return r.Diff(s, c, p.meta)
+}
+
+// SimpleDiff is used by the new protocol wrappers to get a diff that doesn't
+// attempt to calculate ignore_changes.
+func (p *Provider) SimpleDiff(
+	info *terraform.InstanceInfo,
+	s *terraform.InstanceState,
+	c *terraform.ResourceConfig) (*terraform.InstanceDiff, error) {
+	r, ok := p.ResourcesMap[info.Type]
+	if !ok {
+		return nil, fmt.Errorf("unknown resource type: %s", info.Type)
+	}
+
+	return r.simpleDiff(s, c, p.meta)
 }
 
 // Refresh implementation of terraform.ResourceProvider interface.
@@ -204,7 +339,7 @@ func (p *Provider) Refresh(
 // Resources implementation of terraform.ResourceProvider interface.
 func (p *Provider) Resources() []terraform.ResourceType {
 	keys := make([]string, 0, len(p.ResourcesMap))
-	for k, _ := range p.ResourcesMap {
+	for k := range p.ResourcesMap {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -222,6 +357,10 @@ func (p *Provider) Resources() []terraform.ResourceType {
 		result = append(result, terraform.ResourceType{
 			Name:       k,
 			Importable: resource.Importer != nil,
+
+			// Indicates that a provider is compiled against a new enough
+			// version of core to support the GetSchema method.
+			SchemaAvailable: true,
 		})
 	}
 
@@ -299,7 +438,7 @@ func (p *Provider) ReadDataDiff(
 		return nil, fmt.Errorf("unknown data source: %s", info.Type)
 	}
 
-	return r.Diff(nil, c)
+	return r.Diff(nil, c, p.meta)
 }
 
 // RefreshData implementation of terraform.ResourceProvider interface.
@@ -327,6 +466,10 @@ func (p *Provider) DataSources() []terraform.DataSource {
 	for _, k := range keys {
 		result = append(result, terraform.DataSource{
 			Name: k,
+
+			// Indicates that a provider is compiled against a new enough
+			// version of core to support the GetSchema method.
+			SchemaAvailable: true,
 		})
 	}
 

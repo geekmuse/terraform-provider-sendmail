@@ -2,11 +2,10 @@ package dag
 
 import (
 	"fmt"
-	"log"
 	"sort"
 	"strings"
-	"sync"
-	"time"
+
+	"github.com/hashicorp/terraform/tfdiags"
 
 	"github.com/hashicorp/go-multierror"
 )
@@ -18,23 +17,26 @@ type AcyclicGraph struct {
 }
 
 // WalkFunc is the callback used for walking the graph.
-type WalkFunc func(Vertex) error
+type WalkFunc func(Vertex) tfdiags.Diagnostics
 
 // DepthWalkFunc is a walk function that also receives the current depth of the
 // walk as an argument
 type DepthWalkFunc func(Vertex, int) error
 
+func (g *AcyclicGraph) DirectedGraph() Grapher {
+	return g
+}
+
 // Returns a Set that includes every Vertex yielded by walking down from the
 // provided starting Vertex v.
-func (g *AcyclicGraph) Ancestors(v Vertex) (*Set, error) {
-	s := new(Set)
-	start := AsVertexList(g.DownEdges(v))
+func (g *AcyclicGraph) Ancestors(v Vertex) (Set, error) {
+	s := make(Set)
 	memoFunc := func(v Vertex, d int) error {
 		s.Add(v)
 		return nil
 	}
 
-	if err := g.DepthFirstWalk(start, memoFunc); err != nil {
+	if err := g.DepthFirstWalk(g.downEdgesNoCopy(v), memoFunc); err != nil {
 		return nil, err
 	}
 
@@ -43,15 +45,14 @@ func (g *AcyclicGraph) Ancestors(v Vertex) (*Set, error) {
 
 // Returns a Set that includes every Vertex yielded by walking up from the
 // provided starting Vertex v.
-func (g *AcyclicGraph) Descendents(v Vertex) (*Set, error) {
-	s := new(Set)
-	start := AsVertexList(g.UpEdges(v))
+func (g *AcyclicGraph) Descendents(v Vertex) (Set, error) {
+	s := make(Set)
 	memoFunc := func(v Vertex, d int) error {
 		s.Add(v)
 		return nil
 	}
 
-	if err := g.ReverseDepthFirstWalk(start, memoFunc); err != nil {
+	if err := g.ReverseDepthFirstWalk(g.upEdgesNoCopy(v), memoFunc); err != nil {
 		return nil, err
 	}
 
@@ -64,7 +65,7 @@ func (g *AcyclicGraph) Descendents(v Vertex) (*Set, error) {
 func (g *AcyclicGraph) Root() (Vertex, error) {
 	roots := make([]Vertex, 0, 1)
 	for _, v := range g.Vertices() {
-		if g.UpEdges(v).Len() == 0 {
+		if g.upEdgesNoCopy(v).Len() == 0 {
 			roots = append(roots, v)
 		}
 	}
@@ -100,12 +101,11 @@ func (g *AcyclicGraph) TransitiveReduction() {
 	//
 	// For each v-prime reachable from v, remove the edge (u, v-prime).
 	for _, u := range g.Vertices() {
-		uTargets := g.DownEdges(u)
-		vs := AsVertexList(g.DownEdges(u))
+		uTargets := g.downEdgesNoCopy(u)
 
-		g.DepthFirstWalk(vs, func(v Vertex, d int) error {
-			shared := uTargets.Intersection(g.DownEdges(v))
-			for _, vPrime := range AsVertexList(shared) {
+		g.DepthFirstWalk(g.downEdgesNoCopy(u), func(v Vertex, d int) error {
+			shared := uTargets.Intersection(g.downEdgesNoCopy(v))
+			for _, vPrime := range shared {
 				g.RemoveEdge(BasicEdge(u, vPrime))
 			}
 
@@ -158,105 +158,19 @@ func (g *AcyclicGraph) Cycles() [][]Vertex {
 }
 
 // Walk walks the graph, calling your callback as each node is visited.
-// This will walk nodes in parallel if it can. Because the walk is done
-// in parallel, the error returned will be a multierror.
-func (g *AcyclicGraph) Walk(cb WalkFunc) error {
-	// Cache the vertices since we use it multiple times
-	vertices := g.Vertices()
-
-	// Build the waitgroup that signals when we're done
-	var wg sync.WaitGroup
-	wg.Add(len(vertices))
-	doneCh := make(chan struct{})
-	go func() {
-		defer close(doneCh)
-		wg.Wait()
-	}()
-
-	// The map of channels to watch to wait for vertices to finish
-	vertMap := make(map[Vertex]chan struct{})
-	for _, v := range vertices {
-		vertMap[v] = make(chan struct{})
-	}
-
-	// The map of whether a vertex errored or not during the walk
-	var errLock sync.Mutex
-	var errs error
-	errMap := make(map[Vertex]bool)
-	for _, v := range vertices {
-		// Build our list of dependencies and the list of channels to
-		// wait on until we start executing for this vertex.
-		deps := AsVertexList(g.DownEdges(v))
-		depChs := make([]<-chan struct{}, len(deps))
-		for i, dep := range deps {
-			depChs[i] = vertMap[dep]
-		}
-
-		// Get our channel so that we can close it when we're done
-		ourCh := vertMap[v]
-
-		// Start the goroutine to wait for our dependencies
-		readyCh := make(chan bool)
-		go func(v Vertex, deps []Vertex, chs []<-chan struct{}, readyCh chan<- bool) {
-			// First wait for all the dependencies
-			for i, ch := range chs {
-			DepSatisfied:
-				for {
-					select {
-					case <-ch:
-						break DepSatisfied
-					case <-time.After(time.Second * 5):
-						log.Printf("[DEBUG] vertex %s, waiting for: %s",
-							VertexName(v), VertexName(deps[i]))
-					}
-				}
-				log.Printf("[DEBUG] vertex %s, got dep: %s",
-					VertexName(v), VertexName(deps[i]))
-			}
-
-			// Then, check the map to see if any of our dependencies failed
-			errLock.Lock()
-			defer errLock.Unlock()
-			for _, dep := range deps {
-				if errMap[dep] {
-					errMap[v] = true
-					readyCh <- false
-					return
-				}
-			}
-
-			readyCh <- true
-		}(v, deps, depChs, readyCh)
-
-		// Start the goroutine that executes
-		go func(v Vertex, doneCh chan<- struct{}, readyCh <-chan bool) {
-			defer close(doneCh)
-			defer wg.Done()
-
-			var err error
-			if ready := <-readyCh; ready {
-				err = cb(v)
-			}
-
-			errLock.Lock()
-			defer errLock.Unlock()
-			if err != nil {
-				errMap[v] = true
-				errs = multierror.Append(errs, err)
-			}
-		}(v, ourCh, readyCh)
-	}
-
-	<-doneCh
-	return errs
+// This will walk nodes in parallel if it can. The resulting diagnostics
+// contains problems from all graphs visited, in no particular order.
+func (g *AcyclicGraph) Walk(cb WalkFunc) tfdiags.Diagnostics {
+	w := &Walker{Callback: cb, Reverse: true}
+	w.Update(g)
+	return w.Wait()
 }
 
 // simple convenience helper for converting a dag.Set to a []Vertex
-func AsVertexList(s *Set) []Vertex {
-	rawList := s.List()
-	vertexList := make([]Vertex, len(rawList))
-	for i, raw := range rawList {
-		vertexList[i] = raw.(Vertex)
+func AsVertexList(s Set) []Vertex {
+	vertexList := make([]Vertex, 0, len(s))
+	for _, raw := range s {
+		vertexList = append(vertexList, raw.(Vertex))
 	}
 	return vertexList
 }
@@ -266,10 +180,48 @@ type vertexAtDepth struct {
 	Depth  int
 }
 
-// depthFirstWalk does a depth-first walk of the graph starting from
-// the vertices in start. This is not exported now but it would make sense
-// to export this publicly at some point.
-func (g *AcyclicGraph) DepthFirstWalk(start []Vertex, f DepthWalkFunc) error {
+// DepthFirstWalk does a depth-first walk of the graph starting from
+// the vertices in start.
+func (g *AcyclicGraph) DepthFirstWalk(start Set, f DepthWalkFunc) error {
+	seen := make(map[Vertex]struct{})
+	frontier := make([]*vertexAtDepth, 0, len(start))
+	for _, v := range start {
+		frontier = append(frontier, &vertexAtDepth{
+			Vertex: v,
+			Depth:  0,
+		})
+	}
+	for len(frontier) > 0 {
+		// Pop the current vertex
+		n := len(frontier)
+		current := frontier[n-1]
+		frontier = frontier[:n-1]
+
+		// Check if we've seen this already and return...
+		if _, ok := seen[current.Vertex]; ok {
+			continue
+		}
+		seen[current.Vertex] = struct{}{}
+
+		// Visit the current node
+		if err := f(current.Vertex, current.Depth); err != nil {
+			return err
+		}
+
+		for _, v := range g.downEdgesNoCopy(current.Vertex) {
+			frontier = append(frontier, &vertexAtDepth{
+				Vertex: v,
+				Depth:  current.Depth + 1,
+			})
+		}
+	}
+
+	return nil
+}
+
+// SortedDepthFirstWalk does a depth-first walk of the graph starting from
+// the vertices in start, always iterating the nodes in a consistent order.
+func (g *AcyclicGraph) SortedDepthFirstWalk(start []Vertex, f DepthWalkFunc) error {
 	seen := make(map[Vertex]struct{})
 	frontier := make([]*vertexAtDepth, len(start))
 	for i, v := range start {
@@ -296,8 +248,9 @@ func (g *AcyclicGraph) DepthFirstWalk(start []Vertex, f DepthWalkFunc) error {
 		}
 
 		// Visit targets of this in a consistent order.
-		targets := AsVertexList(g.DownEdges(current.Vertex))
+		targets := AsVertexList(g.downEdgesNoCopy(current.Vertex))
 		sort.Sort(byVertexName(targets))
+
 		for _, t := range targets {
 			frontier = append(frontier, &vertexAtDepth{
 				Vertex: t,
@@ -309,9 +262,48 @@ func (g *AcyclicGraph) DepthFirstWalk(start []Vertex, f DepthWalkFunc) error {
 	return nil
 }
 
-// reverseDepthFirstWalk does a depth-first walk _up_ the graph starting from
+// ReverseDepthFirstWalk does a depth-first walk _up_ the graph starting from
 // the vertices in start.
-func (g *AcyclicGraph) ReverseDepthFirstWalk(start []Vertex, f DepthWalkFunc) error {
+func (g *AcyclicGraph) ReverseDepthFirstWalk(start Set, f DepthWalkFunc) error {
+	seen := make(map[Vertex]struct{})
+	frontier := make([]*vertexAtDepth, 0, len(start))
+	for _, v := range start {
+		frontier = append(frontier, &vertexAtDepth{
+			Vertex: v,
+			Depth:  0,
+		})
+	}
+	for len(frontier) > 0 {
+		// Pop the current vertex
+		n := len(frontier)
+		current := frontier[n-1]
+		frontier = frontier[:n-1]
+
+		// Check if we've seen this already and return...
+		if _, ok := seen[current.Vertex]; ok {
+			continue
+		}
+		seen[current.Vertex] = struct{}{}
+
+		for _, t := range g.upEdgesNoCopy(current.Vertex) {
+			frontier = append(frontier, &vertexAtDepth{
+				Vertex: t,
+				Depth:  current.Depth + 1,
+			})
+		}
+
+		// Visit the current node
+		if err := f(current.Vertex, current.Depth); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// SortedReverseDepthFirstWalk does a depth-first walk _up_ the graph starting from
+// the vertices in start, always iterating the nodes in a consistent order.
+func (g *AcyclicGraph) SortedReverseDepthFirstWalk(start []Vertex, f DepthWalkFunc) error {
 	seen := make(map[Vertex]struct{})
 	frontier := make([]*vertexAtDepth, len(start))
 	for i, v := range start {
@@ -332,19 +324,19 @@ func (g *AcyclicGraph) ReverseDepthFirstWalk(start []Vertex, f DepthWalkFunc) er
 		}
 		seen[current.Vertex] = struct{}{}
 
-		// Visit the current node
-		if err := f(current.Vertex, current.Depth); err != nil {
-			return err
-		}
-
-		// Visit targets of this in a consistent order.
-		targets := AsVertexList(g.UpEdges(current.Vertex))
+		// Add next set of targets in a consistent order.
+		targets := AsVertexList(g.upEdgesNoCopy(current.Vertex))
 		sort.Sort(byVertexName(targets))
 		for _, t := range targets {
 			frontier = append(frontier, &vertexAtDepth{
 				Vertex: t,
 				Depth:  current.Depth + 1,
 			})
+		}
+
+		// Visit the current node
+		if err := f(current.Vertex, current.Depth); err != nil {
+			return err
 		}
 	}
 

@@ -17,11 +17,11 @@ EMAIL
 
 ## get it
 
-`go get github.com/roboll/terraform-provider-sendmail`
+`go get github.com/geekmuse/terraform-provider-sendmail`
 
 _or_
 
-`curl -L -o /usr/local/bin/terraform-provider-sendmail https://github.com/roboll/terraform-provider-sendmail/releases/download/{VERSION}/terraform-provider-sendmail_{OS}_{ARCH}`
+`curl -L -o /usr/local/bin/terraform-provider-sendmail https://github.com/geekmuse/terraform-provider-sendmail/releases/download/{VERSION}/terraform-provider-sendmail_{OS}_{ARCH}`
 
 ## development
 
